@@ -77,6 +77,7 @@ pub(crate) fn cat<T: Terminal>(
             let index = file.index();
             let lines = file.lines();
             let last = last_read.get(index).cloned().unwrap_or(0);
+            file.set_desired_lines(last + max_lines);
             if lines >= last {
                 let lines = (last + max_lines).min(lines);
                 result.reserve(lines - last);
