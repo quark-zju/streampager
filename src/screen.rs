@@ -910,6 +910,12 @@ impl Screen {
         Some(Action::Render)
     }
 
+    /// Invalidate caches.
+    pub(crate) fn invalidate_caches(&mut self) {
+        self.search_line_cache.clear();
+        self.line_cache.clear();
+    }
+
     /// Move the currently selected match to a new match.
     pub(crate) fn move_match(&mut self, motion: MatchMotion) {
         self.refresh_matched_line();

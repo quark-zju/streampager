@@ -17,6 +17,8 @@ pub(crate) enum Event {
     Input(InputEvent),
     /// A file has finished loading.
     Loaded(usize),
+    /// A file has been truncated. Hint for invalidating caches.
+    Truncated(usize),
     /// Render an update to the screen.
     Render,
     /// Refresh the whole screen.

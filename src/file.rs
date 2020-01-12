@@ -1,16 +1,16 @@
 //! Files.
 use anyhow::{Context, Error};
-use memmap::Mmap;
 use std::borrow::Cow;
-use std::cmp::min;
 use std::ffi::OsStr;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Duration;
 
 use crate::buffer::Buffer;
+use crate::buffile::BufFile;
 use crate::event::{Event, EventSender};
 
 /// Buffer size to use when loading and parsing files.  This is also the block
@@ -24,11 +24,8 @@ enum FileData {
     /// vector of buffers.
     Streamed { buffers: Arc<RwLock<Vec<Buffer>>> },
 
-    /// Data content has been memory mapped.
-    Mapped { mmap: Arc<Mmap> },
-
-    /// File is empty.
-    Empty,
+    /// Content from a (changing) file on disk.
+    File { file: BufFile },
 
     /// Static content.
     Static { data: &'static [u8] },
@@ -132,45 +129,94 @@ impl FileData {
         Ok(FileData::Streamed { buffers })
     }
 
-    /// Create a new memory mapped file.
+    /// Create a new `File` backed by a seekable `std::fs::File`.
     ///
-    /// The `file` is memory mapped and then a background thread is started to
-    /// parse the newlines in the file.  The parsing progress is stored in
-    /// `meta`.
+    /// The `file` will be parsed in background for new lines. The parsing
+    /// progress is stored in `meta`. Once the file is fully parsed, the
+    /// background thread will monitor file length changes and parse the
+    /// changes on demand.
     ///
-    /// Returns `FileData` containing the memory map.
-    fn new_mapped(
+    /// Returns `FileData` containing `BufFile` for reading file content.
+    fn new_seekable_file(
         file: std::fs::File,
         meta: Arc<FileMeta>,
         event_sender: EventSender,
     ) -> Result<FileData, Error> {
-        // We can't mmap empty files, so just return an empty filedata if the
-        // file's length is 0.
-        if file.metadata()?.len() == 0 {
-            meta.finished.store(true, Ordering::SeqCst);
-            event_sender.send(Event::Loaded(meta.index))?;
-            return Ok(FileData::Empty);
-        }
-        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
-        thread::spawn({
-            let mmap = mmap.clone();
-            move || {
-                let len = mmap.len();
-                let blocks = (len + BUFFER_SIZE - 1) / BUFFER_SIZE;
-                for block in 0..blocks {
-                    let mut newlines = meta.newlines.write().unwrap();
-                    for i in block * BUFFER_SIZE..min((block + 1) * BUFFER_SIZE, len) {
-                        if mmap[i] == b'\n' {
-                            newlines.push(i);
+        let mut file_len = file.metadata()?.len() as usize;
+        let file = BufFile::new(file);
+        let file_cloned = file.clone();
+        thread::spawn(move || {
+            let result = (|| -> io::Result<()> {
+                let mut parsed_len = 0; // parsed bytes (for newlines)
+                let mut sleep_ms = 40; // interval for checking file changes
+                let mut new_newlines = Vec::new(); // newly parsed newlines local to thread
+                loop {
+                    if parsed_len < file_len {
+                        // Parse more lines.
+                        let end = (parsed_len / BUFFER_SIZE + 1) * BUFFER_SIZE;
+                        // Do not take both BufFile, and newlines locks to avoid deadlock.
+                        let read_len = file.read_slice(parsed_len, end, |buf| {
+                            new_newlines.clear();
+                            for (i, &b) in buf.iter().enumerate() {
+                                if b == b'\n' {
+                                    new_newlines.push(i + parsed_len);
+                                }
+                            }
+                            buf.len()
+                        });
+                        let mut newlines = meta.newlines.write().unwrap();
+                        newlines.extend_from_slice(&new_newlines);
+                        parsed_len += read_len;
+                    } else {
+                        // Check whether the file length has changed.
+                        let new_file_len = file.read_len()? as usize;
+                        if new_file_len == file_len {
+                            if !meta
+                                .finished
+                                .compare_and_swap(false, true, Ordering::SeqCst)
+                            {
+                                // File was "fully loaded".
+                                meta.length.store(file_len, Ordering::SeqCst);
+                                event_sender.send(Event::Loaded(meta.index)).unwrap();
+                            }
+                            thread::sleep(Duration::from_millis(sleep_ms));
+                            if sleep_ms < 1000 {
+                                sleep_ms *= 2;
+                            }
+                        } else {
+                            if new_file_len < file_len {
+                                // File was truncated. Re-parse from start.
+                                parsed_len = 0;
+                                meta.length.store(0, Ordering::SeqCst);
+                                meta.newlines.write().unwrap().clear();
+                                file.invalidate_cache();
+                            }
+                            if meta
+                                .finished
+                                .compare_and_swap(true, false, Ordering::SeqCst)
+                            {
+                                let event = if new_file_len < file_len {
+                                    Event::Truncated(meta.index)
+                                } else {
+                                    Event::RefreshOverlay
+                                };
+                                event_sender.send(event).unwrap();
+                            }
+                            sleep_ms = 40;
+                            file_len = new_file_len;
                         }
                     }
                 }
-                meta.length.store(len, Ordering::SeqCst);
-                meta.finished.store(true, Ordering::SeqCst);
-                event_sender.send(Event::Loaded(meta.index)).unwrap();
+            })();
+
+            if let Err(e) = result {
+                let mut error = meta.error.write().unwrap();
+                *error = Some(e.into());
             }
+
+            event_sender.send(Event::Loaded(meta.index)).unwrap();
         });
-        Ok(FileData::Mapped { mmap })
+        Ok(FileData::File { file: file_cloned })
     }
 
     /// Create a new file from static data.
@@ -233,8 +279,7 @@ impl FileData {
                     call(Cow::Owned(v))
                 }
             }
-            FileData::Mapped { mmap } => call(Cow::Borrowed(&mmap[start..end])),
-            FileData::Empty => call(Cow::Borrowed(&[])),
+            FileData::File { file } => file.read_slice(start, end, call),
             FileData::Static { data } => call(Cow::Borrowed(&data[start..end])),
         }
     }
@@ -263,8 +308,8 @@ impl File {
         Ok(File { data, meta })
     }
 
-    /// Load a file by memory mapping it if possible.
-    pub(crate) fn new_mapped(
+    /// Load a file from a path.
+    pub(crate) fn new_path(
         index: usize,
         filename: &OsStr,
         event_sender: EventSender,
@@ -273,10 +318,9 @@ impl File {
         let meta = Arc::new(FileMeta::new(index, title.clone()));
         let mut file = std::fs::File::open(filename).context(title)?;
         // Determine whether this file is a real file, or some kind of pipe, by
-        // attempting to do a no-op seek.  If it fails, assume we can't mmap
-        // it.
+        // attempting to do a no-op seek.  If it fails, avoid the seekable interface.
         let data = match file.seek(SeekFrom::Current(0)) {
-            Ok(_) => FileData::new_mapped(file, meta.clone(), event_sender)?,
+            Ok(_) => FileData::new_seekable_file(file, meta.clone(), event_sender)?,
             Err(_) => FileData::new_streamed(file, meta.clone(), event_sender)?,
         };
         Ok(File { data, meta })

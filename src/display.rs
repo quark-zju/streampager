@@ -274,6 +274,11 @@ pub(crate) fn start(
                 Some(Event::Loaded(index)) if screens.is_current_index(index) => {
                     Some(Action::Refresh)
                 }
+                Some(Event::Truncated(index)) if screens.is_current_index(index) => {
+                    let screen = screens.current();
+                    screen.invalidate_caches();
+                    Some(Action::Refresh)
+                }
                 Some(Event::SearchFirstMatch(index)) => screens
                     .get(index)
                     .and_then(|screen| screen.search_first_match()),
